@@ -34,6 +34,7 @@ from typing import IO
 
 from . import http
 from .encodings import MissingEncoding, convert_file_to_utf8
+from .exceptions import MaxBytesExceeded
 from .html import BaseHTMLProcessor
 from .mixin import XMLParserMixin
 from .parsers.json import JSONParser
@@ -74,6 +75,7 @@ SUPPORTED_VERSIONS = {
 def _open_resource(
     url_file_stream_or_string,
     result,
+    max_bytes=None,
 ):
     """URL, filename, or string --> stream
 
@@ -83,7 +85,13 @@ def _open_resource(
     to have all the basic stdio read methods (read, readline, readlines).
     Just .close() the object when you're done with it.
 
+    :param max_bytes:
+        If not ``None``, the maximum number of body bytes to accept
+        (after decompression, before character transcoding).
+        At most ``max_bytes + 1`` bytes are read to enforce the budget.
+
     :return: A seekable, readable file object.
+    :raises MaxBytesExceeded: if the body exceeds ``max_bytes``.
     """
 
     # Some notes on the history of the implementation of _open_resource().
@@ -102,6 +110,11 @@ def _open_resource(
     # the content is read and wrapped in a io.BytesIO/StringIO.)
 
     if callable(getattr(url_file_stream_or_string, "read", None)):
+        if max_bytes is not None:
+            # Read at most max_bytes + 1 units to enforce the budget;
+            # the caller's stream itself is never closed.
+            data = _read_bounded(url_file_stream_or_string, max_bytes)
+            return _to_in_memory_file(data)
         if callable(getattr(url_file_stream_or_string, "seekable", None)):
             if url_file_stream_or_string.seekable():
                 return url_file_stream_or_string
@@ -114,12 +127,12 @@ def _open_resource(
         "https",
     )
     if looks_like_url:
-        data = http.get(url_file_stream_or_string, result)
+        data = http.get(url_file_stream_or_string, result, max_bytes)
         return io.BytesIO(data)
 
     # try to open with native open function (if url_file_stream_or_string is a filename)
     try:
-        return open(url_file_stream_or_string, "rb")
+        file = open(url_file_stream_or_string, "rb")
     except (OSError, TypeError, ValueError):
         # if url_file_stream_or_string is a str object that
         # cannot be converted to the encoding returned by
@@ -129,9 +142,86 @@ def _open_resource(
         # (such as an XML document encoded in UTF-32), TypeError will
         # be thrown.
         pass
+    else:
+        if max_bytes is None:
+            return file
+        try:
+            _read_bounded(file, max_bytes)
+        except BaseException:
+            # The file is owned by the library; close it on failure.
+            file.close()
+            raise
+        file.seek(0)
+        return file
 
     # treat url_file_stream_or_string as bytes/string
+    if max_bytes is not None:
+        _check_size(url_file_stream_or_string, max_bytes)
     return _to_in_memory_file(url_file_stream_or_string)
+
+
+def _size_of(data):
+    """The body size of in-memory data, in bytes.
+
+    Text is measured as its UTF-8 encoded length.
+    """
+
+    if isinstance(data, str):
+        return len(data.encode("utf-8"))
+    return len(data)
+
+
+def _check_size(data, max_bytes):
+    if _size_of(data) > max_bytes:
+        raise MaxBytesExceeded(
+            "the feed body exceeds the max_bytes budget of %d bytes" % max_bytes
+        )
+
+
+def _read_bounded(stream, max_bytes):
+    """Read at most ``max_bytes`` body bytes from a stream.
+
+    Never reads more than ``max_bytes + 1`` units from the stream,
+    so the budget cannot be bypassed by reading everything first.
+
+    :raises MaxBytesExceeded: if the stream holds more than ``max_bytes``.
+    """
+
+    if isinstance(stream.read(0), str):
+        # Text stream: the budget applies to the UTF-8 encoded size.
+        # max_bytes + 1 characters always encode to at least
+        # max_bytes + 1 bytes, so reading further is never necessary.
+        chunks = []
+        total = 0
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = stream.read(remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+            total += len(chunk.encode("utf-8"))
+            if total > max_bytes:
+                raise MaxBytesExceeded(
+                    "the feed body exceeds the max_bytes budget "
+                    "of %d bytes" % max_bytes
+                )
+        return "".join(chunks)
+
+    chunks = []
+    remaining = max_bytes + 1
+    while remaining > 0:
+        chunk = stream.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    data = b"".join(chunks)
+    if len(data) > max_bytes:
+        raise MaxBytesExceeded(
+            "the feed body exceeds the max_bytes budget of %d bytes" % max_bytes
+        )
+    return data
 
 
 def _to_in_memory_file(data):
@@ -154,6 +244,7 @@ def parse(
     resolve_relative_uris: bool | None = None,
     sanitize_html: bool | None = None,
     optimistic_encoding_detection: bool | None = None,
+    max_bytes: int | None = None,
 ) -> FeedParserDict:
     """Parse a feed from a URL, file, stream, or string.
 
@@ -188,8 +279,22 @@ def parse(
         (uses less memory, but the wrong encoding may be detected in rare cases).
         Defaults to the value of
         :data:`feedparser.OPTIMISTIC_ENCODING_DETECTION`, which is ``True``.
+    :param max_bytes:
+        The maximum number of body bytes to accept, counted after
+        decompression (for HTTP responses) and before character transcoding.
+        ``None`` (the default) imposes no limit. If the body exceeds the
+        budget, the result is marked as bozo with a
+        :exc:`~feedparser.exceptions.MaxBytesExceeded` exception,
+        and ``feed`` and ``entries`` are empty.
 
     """
+
+    if max_bytes is not None and (
+        isinstance(max_bytes, bool)
+        or not isinstance(max_bytes, int)
+        or max_bytes < 1
+    ):
+        raise ValueError("max_bytes must be a positive integer or None")
 
     result = FeedParserDict(
         bozo=False,
@@ -202,8 +307,17 @@ def parse(
         file = _open_resource(
             url_file_stream_or_string,
             result,
+            max_bytes,
         )
     except urllib.error.URLError as error:
+        result.update(
+            {
+                "bozo": True,
+                "bozo_exception": error,
+            }
+        )
+        return result
+    except MaxBytesExceeded as error:
         result.update(
             {
                 "bozo": True,

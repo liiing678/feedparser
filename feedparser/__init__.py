@@ -31,6 +31,7 @@ from .exceptions import (
     CharacterEncodingOverride,
     CharacterEncodingUnknown,
     FeedparserError,
+    MaxBytesExceeded,
     NonXMLContentType,
     UndeclaredNamespace,
 )
@@ -57,6 +58,7 @@ __all__ = (
     "FeedparserError",
     "CharacterEncodingOverride",
     "CharacterEncodingUnknown",
+    "MaxBytesExceeded",
     "NonXMLContentType",
     "UndeclaredNamespace",
 )

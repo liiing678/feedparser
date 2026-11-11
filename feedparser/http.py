@@ -30,8 +30,10 @@ from __future__ import annotations
 import typing
 
 import requests
+import urllib3
 
 from .datetimes import _parse_date
+from .exceptions import MaxBytesExceeded
 
 # HTTP "Accept" header to send to servers when downloading feeds.
 ACCEPT_HEADER: str = (
@@ -45,13 +47,18 @@ ACCEPT_HEADER: str = (
     ";q=0.1"
 )
 
+# How many (decompressed) bytes to read from a response body at a time
+# when a max_bytes budget is enforced.
+READ_CHUNK_SIZE = 2**16
 
-def get(url: str, result: dict[str, typing.Any]) -> bytes:
+
+def get(url: str, result: dict[str, typing.Any], max_bytes: int | None = None) -> bytes:
     try:
         response = requests.get(
             url,
             headers={"Accept": ACCEPT_HEADER},
             timeout=10,
+            stream=max_bytes is not None,
         )
     except requests.RequestException as exception:
         result["bozo"] = True
@@ -71,4 +78,50 @@ def get(url: str, result: dict[str, typing.Any]) -> bytes:
             result["modified_parsed"] = _parse_date(modified)
     result["href"] = response.url
     result["status"] = response.status_code
-    return response.content
+
+    if max_bytes is None:
+        return response.content
+
+    try:
+        return _read_bounded(response, max_bytes)
+    except MaxBytesExceeded as exception:
+        result["bozo"] = True
+        result["bozo_exception"] = exception
+        return b""
+    except (requests.RequestException, urllib3.exceptions.HTTPError) as exception:
+        result["bozo"] = True
+        result["bozo_exception"] = exception
+        return b""
+    finally:
+        # The response is owned by the library; always release it.
+        response.close()
+
+
+def _read_bounded(response: requests.Response, max_bytes: int) -> bytes:
+    """Read at most ``max_bytes`` decompressed bytes from a streamed response.
+
+    Decompression (gzip, including concatenated members, zlib-wrapped
+    deflate, and raw deflate) is performed incrementally by urllib3,
+    so a compressed body cannot bypass the budget and the full body is
+    never read or decompressed before the budget is checked.
+
+    :raises MaxBytesExceeded: if the decompressed body exceeds ``max_bytes``.
+    """
+
+    chunks = []
+    total = 0
+    while total <= max_bytes:
+        chunk = response.raw.read(
+            min(READ_CHUNK_SIZE, max_bytes + 1 - total),
+            decode_content=True,
+        )
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    if total > max_bytes:
+        raise MaxBytesExceeded(
+            "the decompressed response body exceeds the max_bytes budget "
+            "of %d bytes" % max_bytes
+        )
+    return b"".join(chunks)

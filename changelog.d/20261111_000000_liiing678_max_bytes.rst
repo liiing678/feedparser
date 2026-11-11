@@ -1,0 +1,16 @@
+Added
+-----
+
+*   Add a ``max_bytes`` parameter to ``feedparser.parse()``.
+
+    When set to a positive integer, it limits the number of body bytes
+    that are accepted, counted after decompression and before character
+    transcoding. The budget is enforced while reading, so at most
+    ``max_bytes + 1`` bytes are ever read or decompressed;
+    HTTP gzip (including concatenated members), zlib, and raw deflate
+    bodies cannot bypass it.
+
+    If the body exceeds the budget, the result is marked as bozo with
+    a ``feedparser.MaxBytesExceeded`` exception, ``feed`` and ``entries``
+    are empty, and any HTTP metadata gathered so far remains available.
+    The default, ``None``, preserves the previous behavior.

@@ -30,6 +30,7 @@ __all__ = [
     "FeedparserError",
     "CharacterEncodingOverride",
     "CharacterEncodingUnknown",
+    "MaxBytesExceeded",
     "NonXMLContentType",
     "UndeclaredNamespace",
 ]
@@ -44,6 +45,16 @@ class CharacterEncodingOverride(FeedparserError):
 
 
 class CharacterEncodingUnknown(FeedparserError):
+    pass
+
+
+class MaxBytesExceeded(FeedparserError):
+    """The feed body exceeded the ``max_bytes`` budget given to ``parse()``.
+
+    The budget applies to the decompressed body bytes,
+    before any character transcoding takes place.
+    """
+
     pass
 
 
